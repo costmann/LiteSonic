@@ -63,7 +63,7 @@ public sealed class Scanner(AppConfig cfg, Db db, ILogger<Scanner> log)
         var now = SqliteExt.Now();
 
         using var c = db.Open();
-        using var sel = c.Cmd("SELECT id, mtime, size FROM tracks WHERE path=$p", ("$p", ""));
+        using var sel = c.Cmd("SELECT id, mtime, size, album_id FROM tracks WHERE path=$p", ("$p", ""));
         using var touch = c.Cmd("UPDATE tracks SET scan_id=$s WHERE id=$id", ("$s", scanId), ("$id", 0L));
         using var upsert = c.Cmd("""
             INSERT INTO tracks(path, mtime, size, album_id, artist_id, artist, title, track_no, disc_no, year, genre,
@@ -79,14 +79,19 @@ public sealed class Scanner(AppConfig cfg, Db db, ILogger<Scanner> log)
             """);
         foreach (var p in new[] { "$path", "$mtime", "$size", "$album", "$artistId", "$artist", "$title", "$track", "$disc", "$year", "$genre", "$dur", "$br", "$suffix", "$ct", "$cover", "$created", "$scan" })
             upsert.Parameters.Add(new SqliteParameter(p, DBNull.Value));
+        // Copertina della cartella: aggiornata anche per gli album i cui brani non sono cambiati
+        // (cover.jpg aggiunta o sostituita dopo). Una cartella senza immagine non cancella quella
+        // trovata in un'altra cartella dello stesso album (es. CD1/CD2).
+        using var setCover = c.Cmd("UPDATE albums SET cover_path=$c WHERE id=$a AND cover_path IS NOT $c", ("$c", ""), ("$a", 0L));
 
         // Cache piccole e limitate alla scansione corrente
         var artistIds = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         var albumIds = new Dictionary<(long, string), long>();
         string? lastDir = null, lastDirCover = null;
+        (string? Dir, long Album) lastCoverCheck = (null, 0);
 
         var tx = c.BeginTransaction();
-        sel.Transaction = touch.Transaction = upsert.Transaction = tx;
+        sel.Transaction = touch.Transaction = upsert.Transaction = setCover.Transaction = tx;
         int inTx = 0;
 
         var opts = new EnumerationOptions
@@ -106,29 +111,34 @@ public sealed class Scanner(AppConfig cfg, Db db, ILogger<Scanner> log)
             long mtime = fi.LastWriteTimeUtc.Ticks;
             Count++;
 
+            var dir = Path.GetDirectoryName(path)!;
+            if (dir != lastDir) { lastDir = dir; lastDirCover = FindDirCover(dir); }
+
             sel.Parameters["$p"].Value = path;
-            long? existingId = null;
+            long albumId;
+            long? oldAlbumId = null;
             using (var r = sel.ExecuteReader())
             {
                 if (r.Read())
                 {
-                    existingId = r.GetInt64(0);
+                    oldAlbumId = r.GetInt64(3);
                     if (!full && r.GetInt64(1) == mtime && r.GetInt64(2) == fi.Length)
                     {
+                        touch.Parameters["$id"].Value = r.GetInt64(0);
                         r.Close();
-                        touch.Parameters["$id"].Value = existingId;
                         touch.ExecuteNonQuery();
-                        goto next;
+                        albumId = oldAlbumId.Value;
+                        goto cover;
                     }
                 }
             }
 
-            var dir = Path.GetDirectoryName(path)!;
-            if (dir != lastDir) { lastDir = dir; lastDirCover = FindDirCover(dir); }
-
             var m = ReadTags(path, ext);
             long artistId = GetArtist(c, tx, artistIds, m.AlbumArtist);
-            long albumId = GetAlbum(c, tx, albumIds, artistId, m.Album, m.Year, m.Genre, lastDirCover, now);
+            albumId = GetAlbum(c, tx, albumIds, artistId, m.Album, m.Year, m.Genre, lastDirCover, now);
+            // il brano è cambiato: la copertina incorporata estratta in cache potrebbe non essere più valida
+            DropCoverCache(albumId);
+            if (oldAlbumId is long old && old != albumId) DropCoverCache(old);
 
             var ps = upsert.Parameters;
             ps["$path"].Value = path; ps["$mtime"].Value = mtime; ps["$size"].Value = fi.Length;
@@ -146,12 +156,20 @@ public sealed class Scanner(AppConfig cfg, Db db, ILogger<Scanner> log)
             upsert.ExecuteNonQuery();
             changed++;
 
-        next:
+        cover:
+            if (lastDirCover is not null && lastCoverCheck != (dir, albumId))
+            {
+                lastCoverCheck = (dir, albumId);
+                setCover.Parameters["$c"].Value = lastDirCover;
+                setCover.Parameters["$a"].Value = albumId;
+                setCover.ExecuteNonQuery();
+            }
+
             if (++inTx >= 500)
             {
                 tx.Commit(); tx.Dispose();
                 tx = c.BeginTransaction();
-                sel.Transaction = touch.Transaction = upsert.Transaction = tx;
+                sel.Transaction = touch.Transaction = upsert.Transaction = setCover.Transaction = tx;
                 inTx = 0;
             }
         }
@@ -172,6 +190,13 @@ public sealed class Scanner(AppConfig cfg, Db db, ILogger<Scanner> log)
         LastScan = DateTime.UtcNow;
         log.LogInformation("Scansione completata in {Ms} ms: {Count} brani, {Changed} aggiornati, {Removed} rimossi",
             sw.ElapsedMilliseconds, Count, changed, removed);
+    }
+
+    void DropCoverCache(long albumId)
+    {
+        var b = Path.Combine(cfg.DataFolder, "covers", "al-" + albumId);
+        foreach (var ext in new[] { ".jpg", ".png" })
+            try { File.Delete(b + ext); } catch { }
     }
 
     static long GetArtist(SqliteConnection c, SqliteTransaction tx, Dictionary<string, long> cache, string name)
