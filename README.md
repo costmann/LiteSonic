@@ -75,6 +75,8 @@ Si configura con `appsettings.json`, con variabili d'ambiente (`LiteSonic__Music
 | `Port` | `4533` | |
 | `AdminUser` / `AdminPassword` | `admin` / generata | Usati solo al primo avvio |
 | `ScanIntervalMinutes` | `60` | `0` = scansione solo all'avvio e con `startScan` |
+| `WatchMusicFolder` | `true` | Scansione incrementale automatica quando cambiano i file (inotify) |
+| `WatchDelaySeconds` | `10` | Attesa dopo l'ultima modifica prima di scansionare |
 | `FfmpegPath` | `ffmpeg` | Vuoto o non trovato = transcodifica disattivata |
 | `MaxConcurrentTranscodes` | `1` | Oltre questo limite il server risponde 503 dopo 10 s |
 | `DefaultTranscodeBitRate` | `128` | kbps |
@@ -89,6 +91,6 @@ Autenticazione: token `t`+`s` (md5), password `p` in chiaro o `enc:`, sia GET si
 
 - Nessuna interfaccia web: si usano i client Subsonic.
 - `getCoverArt` ignora `size` e restituisce l'immagine originale. Ridimensionare in memoria costerebbe RAM; un'alternativa è generare miniature con ffmpeg e tenerle in cache su disco.
-- Nessun file watcher: la libreria si aggiorna con la scansione periodica o con `startScan`.
+- Il file watcher usa inotify (un watch per cartella): con librerie molto grandi può servire alzare `fs.inotify.max_user_watches`. Se non è disponibile resta la scansione periodica. I client che tengono una cache locale (es. substreamer) possono richiedere un aggiornamento manuale della libreria.
 - La ricerca usa `LIKE`. Per librerie enormi si può passare a SQLite FTS5.
 - Per stare dietro un reverse proxy con HTTPS usa Caddy o nginx: Kestrel qui serve solo HTTP.

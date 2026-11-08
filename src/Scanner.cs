@@ -15,19 +15,36 @@ public sealed class Scanner(AppConfig cfg, Db db, ILogger<Scanner> log)
     static readonly string[] CoverNames = ["cover", "folder", "front", "album", "albumart"];
     static readonly string[] CoverExt = [".jpg", ".jpeg", ".png", ".webp"];
 
-    int _running;
+    int _running, _pending;
     public bool IsScanning => Volatile.Read(ref _running) == 1;
     public long Count { get; private set; }
     public DateTime? LastScan { get; private set; }
 
+    /// <summary>
+    /// Avvia una scansione. Se ce n'è già una in corso la richiesta non va persa:
+    /// ne viene eseguita un'altra (incrementale) appena la corrente termina.
+    /// </summary>
     public Task StartAsync(bool full = false)
     {
-        if (Interlocked.Exchange(ref _running, 1) == 1) return Task.CompletedTask;
+        if (Interlocked.Exchange(ref _running, 1) == 1)
+        {
+            Volatile.Write(ref _pending, 1);
+            return Task.CompletedTask;
+        }
         return Task.Run(() =>
         {
-            try { Scan(full); }
-            catch (Exception e) { log.LogError(e, "Scansione fallita"); }
-            finally { Volatile.Write(ref _running, 0); }
+            while (true)
+            {
+                Volatile.Write(ref _pending, 0);
+                try { Scan(full); }
+                catch (Exception e) { log.LogError(e, "Scansione fallita"); }
+                full = false;
+                if (Volatile.Read(ref _pending) == 1) continue;
+                Volatile.Write(ref _running, 0);
+                // richiesta arrivata tra il controllo e il rilascio: riprendila se nessun altro l'ha fatto
+                if (Volatile.Read(ref _pending) == 1 && Interlocked.Exchange(ref _running, 1) == 0) continue;
+                return;
+            }
         });
     }
 
@@ -243,15 +260,61 @@ public sealed class Scanner(AppConfig cfg, Db db, ILogger<Scanner> log)
     static string? Clean(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim().Replace("\0", "");
 }
 
-public sealed class ScanService(Scanner scanner, AppConfig cfg) : BackgroundService
+public sealed class ScanService(Scanner scanner, AppConfig cfg, ILogger<ScanService> log) : BackgroundService
 {
+    FileSystemWatcher? _watcher;
+    Timer? _debounce;
+
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
         await scanner.StartAsync();
+        if (cfg.WatchMusicFolder) StartWatcher();
         if (cfg.ScanIntervalMinutes <= 0) return;
         using var timer = new PeriodicTimer(TimeSpan.FromMinutes(cfg.ScanIntervalMinutes));
         while (await timer.WaitForNextTickAsync(ct))
             await scanner.StartAsync();
+    }
+
+    void StartWatcher()
+    {
+        if (!Directory.Exists(cfg.MusicFolder)) return;
+        try
+        {
+            var delay = TimeSpan.FromSeconds(Math.Max(1, cfg.WatchDelaySeconds));
+            _debounce = new Timer(_ => scanner.StartAsync());
+            _watcher = new FileSystemWatcher(cfg.MusicFolder)
+            {
+                IncludeSubdirectories = true,
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size,
+                InternalBufferSize = 64 * 1024,
+            };
+            FileSystemEventHandler onChange = (_, _) => _debounce.Change(delay, Timeout.InfiniteTimeSpan);
+            _watcher.Created += onChange;
+            _watcher.Deleted += onChange;
+            _watcher.Changed += onChange;
+            _watcher.Renamed += (_, _) => _debounce.Change(delay, Timeout.InfiniteTimeSpan);
+            _watcher.Error += (_, e) =>
+            {
+                // tipicamente buffer pieno: una scansione recupera comunque tutto
+                log.LogWarning("File watcher: {Err}", e.GetException().Message);
+                _debounce.Change(delay, Timeout.InfiniteTimeSpan);
+            };
+            _watcher.EnableRaisingEvents = true;
+            log.LogInformation("File watcher attivo su {Folder}", cfg.MusicFolder);
+        }
+        catch (Exception e)
+        {
+            // es. limite fs.inotify.max_user_watches raggiunto: resta la scansione periodica
+            log.LogWarning("File watcher non disponibile ({Err}): uso solo la scansione periodica", e.Message);
+            _watcher?.Dispose(); _watcher = null;
+        }
+    }
+
+    public override void Dispose()
+    {
+        _watcher?.Dispose();
+        _debounce?.Dispose();
+        base.Dispose();
     }
 }
 
